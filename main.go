@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 	"time"
 
@@ -19,12 +20,14 @@ import (
 )
 
 type Config struct {
-	TelegramToken  string        `env:"TG_TOKEN" required:"true"`
-	TelegramChatID int64         `env:"TG_CHAT_ID" required:"true"`
-	ServerName     string        `env:"SERVER_NAME" default:"MyServer"`
-	IgnoreExitZero bool          `env:"IGNORE_EXIT_ZERO" default:"true"`
-	RequestTimeout time.Duration `env:"REQUEST_TIMEOUT" default:"10s"`
-	ReconnectDelay time.Duration `env:"RECONNECT_DELAY" default:"5s"`
+	TelegramToken     string        `env:"TG_TOKEN" required:"true"`
+	TelegramChatID    int64         `env:"TG_CHAT_ID" required:"true"`
+	ServerName        string        `env:"SERVER_NAME" default:"MyServer"`
+	IgnoreExitZero    bool          `env:"IGNORE_EXIT_ZERO" default:"true"`
+	RequestTimeout    time.Duration `env:"REQUEST_TIMEOUT" default:"10s"`
+	ReconnectDelay    time.Duration `env:"RECONNECT_DELAY" default:"5s"`
+	IncludeContainers []string      `env:"INCLUDE_CONTAINERS"` // List of names to watch (allowlist)
+	ExcludeContainers []string      `env:"EXCLUDE_CONTAINERS"` // List of names to ignore (blocklist)
 }
 
 type Notifier struct {
@@ -109,13 +112,26 @@ func runMonitor(ctx context.Context, n *Notifier) error {
 }
 
 func handleEvent(ctx context.Context, event events.Message, n *Notifier) error {
+	containerName := event.Actor.Attributes["name"]
+
+	// Filter by Name
+	// 1. If Include list is not empty, ONLY allow names in that list.
+	if len(n.cfg.IncludeContainers) > 0 {
+		if !slices.Contains(n.cfg.IncludeContainers, containerName) {
+			return nil // Skip, not in allowlist
+		}
+	}
+
+	// 2. If Exclude list is used, skip names in that list.
+	if slices.Contains(n.cfg.ExcludeContainers, containerName) {
+		return nil // Skip, explicitly excluded
+	}
 	exitCode := event.Actor.Attributes["exitCode"]
 
 	if n.cfg.IgnoreExitZero && exitCode == "0" {
 		return nil
 	}
 
-	containerName := event.Actor.Attributes["name"]
 	imageName := event.Actor.Attributes["image"]
 	ts := time.Unix(event.Time, 0).Format(time.RFC3339)
 
