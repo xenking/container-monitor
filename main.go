@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"slices"
+	"sync"
 	"syscall"
 	"time"
 
@@ -19,20 +19,35 @@ import (
 	"github.com/docker/docker/client"
 )
 
+// Config holds all settings
 type Config struct {
 	TelegramToken     string        `env:"TG_TOKEN" required:"true"`
 	TelegramChatID    int64         `env:"TG_CHAT_ID" required:"true"`
 	ServerName        string        `env:"SERVER_NAME" default:"MyServer"`
+	IncludeContainers []string      `env:"INCLUDE_CONTAINERS"`
+	ExcludeContainers []string      `env:"EXCLUDE_CONTAINERS"`
 	IgnoreExitZero    bool          `env:"IGNORE_EXIT_ZERO" default:"true"`
-	RequestTimeout    time.Duration `env:"REQUEST_TIMEOUT" default:"10s"`
-	ReconnectDelay    time.Duration `env:"RECONNECT_DELAY" default:"5s"`
-	IncludeContainers []string      `env:"INCLUDE_CONTAINERS"` // List of names to watch (allowlist)
-	ExcludeContainers []string      `env:"EXCLUDE_CONTAINERS"` // List of names to ignore (blocklist)
+	DebounceWindow    time.Duration `env:"DEBOUNCE_WINDOW" default:"5m"`  // Time to accumulate errors
+	StabilityPeriod   time.Duration `env:"STABILITY_PERIOD" default:"30s"` // Time to wait before marking "Recovered"
 }
 
-type Notifier struct {
+// ContainerState tracks the health of a single container
+type ContainerState struct {
+	Name           string
+	CrashCount     int
+	LastCrashTime  time.Time
+	IsDown         bool
+	DebounceTimer  *time.Timer // Timer for sending "Crash Loop" summary
+	StabilityTimer *time.Timer // Timer for sending "Recovered" message
+}
+
+// Monitor holds the global state
+type Monitor struct {
 	cfg        Config
 	httpClient *http.Client
+	
+	mu     sync.Mutex
+	states map[string]*ContainerState
 }
 
 func main() {
@@ -42,141 +57,227 @@ func main() {
 		SkipFiles: true,
 		EnvPrefix: "",
 	})
-
 	if err := loader.Load(); err != nil {
-		log.Fatalf("config load error: %v", err)
+		log.Fatalf("config error: %v", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	notifier := &Notifier{
-		cfg: cfg,
-		httpClient: &http.Client{
-			Timeout: cfg.RequestTimeout,
-		},
+	monitor := &Monitor{
+		cfg:        cfg,
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+		states:     make(map[string]*ContainerState),
 	}
 
-	log.Printf("Starting monitor on %s...", cfg.ServerName)
+	log.Printf("🔥 Monitor started on %s", cfg.ServerName)
+	log.Printf("⏱  Debounce: %s | Stability: %s", cfg.DebounceWindow, cfg.StabilityPeriod)
 
+	// Retry loop for Docker connection
 	for {
-		if err := runMonitor(ctx, notifier); err != nil {
-			log.Printf("Monitor error: %v", err)
+		if err := run(ctx, monitor); err != nil {
+			log.Printf("❌ Error: %v. Retrying in 5s...", err)
 		}
-
 		select {
 		case <-ctx.Done():
-			log.Println("Shutting down...")
 			return
-		case <-time.After(cfg.ReconnectDelay):
-			log.Println("Reconnecting to Docker daemon...")
+		case <-time.After(5 * time.Second):
+			continue
 		}
 	}
 }
 
-func runMonitor(ctx context.Context, n *Notifier) error {
+func run(ctx context.Context, m *Monitor) error {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		return fmt.Errorf("docker client create: %w", err)
+		return err
 	}
 	defer cli.Close()
 
 	if _, err := cli.Ping(ctx); err != nil {
-		return fmt.Errorf("docker ping: %w", err)
+		return err
 	}
 
-	filter := filters.NewArgs()
-	filter.Add("type", "container")
-	filter.Add("event", "die")
+	// Filter: We need both 'die' (crash) and 'start' (recovery)
+	args := filters.NewArgs()
+	args.Add("type", "container")
+	args.Add("event", "die")
+	args.Add("event", "start")
 
-	opts := events.ListOptions{
-		Filters: filter,
-	}
+	msgs, errs := cli.Events(ctx, events.ListOptions{Filters: args})
 
-	msgs, errs := cli.Events(ctx, opts)
-
-	log.Println("Listening for events...")
+	log.Println("👀 Listening for Docker events...")
 
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil
 		case err := <-errs:
-			return fmt.Errorf("event stream error: %w", err)
+			return err
 		case event := <-msgs:
-			if err := handleEvent(ctx, event, n); err != nil {
-				log.Printf("Failed to handle event: %v", err)
-			}
+			m.processEvent(ctx, event)
 		}
 	}
 }
 
-func handleEvent(ctx context.Context, event events.Message, n *Notifier) error {
+func (m *Monitor) processEvent(ctx context.Context, event events.Message) {
 	containerName := event.Actor.Attributes["name"]
 
-	// Filter by Name
-	// 1. If Include list is not empty, ONLY allow names in that list.
-	if len(n.cfg.IncludeContainers) > 0 {
-		if !slices.Contains(n.cfg.IncludeContainers, containerName) {
-			return nil // Skip, not in allowlist
-		}
+	// 1. Filter Logic
+	if !m.isContainerAllowed(containerName) {
+		return
 	}
 
-	// 2. If Exclude list is used, skip names in that list.
-	if slices.Contains(n.cfg.ExcludeContainers, containerName) {
-		return nil // Skip, explicitly excluded
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Initialize state if not exists
+	state, exists := m.states[containerName]
+	if !exists {
+		state = &ContainerState{Name: containerName}
+		m.states[containerName] = state
 	}
-	exitCode := event.Actor.Attributes["exitCode"]
 
-	if n.cfg.IgnoreExitZero && exitCode == "0" {
-		return nil
+	switch event.Action {
+	case "die":
+		m.handleDie(ctx, state, event)
+	case "start":
+		m.handleStart(ctx, state)
 	}
-
-	imageName := event.Actor.Attributes["image"]
-	ts := time.Unix(event.Time, 0).Format(time.RFC3339)
-
-	msg := fmt.Sprintf(
-		"🚨 <b>Docker Container Alert</b>\n\n"+
-			"🖥 <b>Server:</b> %s\n"+
-			"📦 <b>Container:</b> %s\n"+
-			"💿 <b>Image:</b> %s\n"+
-			"❌ <b>Exit Code:</b> %s\n"+
-			"🕒 <b>Time:</b> %s",
-		n.cfg.ServerName, containerName, imageName, exitCode, ts,
-	)
-
-	return n.sendTelegram(ctx, msg)
 }
 
-func (n *Notifier) sendTelegram(ctx context.Context, text string) error {
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", n.cfg.TelegramToken)
+// handleDie processes a crash
+func (m *Monitor) handleDie(ctx context.Context, s *ContainerState, event events.Message) {
+	exitCode := event.Actor.Attributes["exitCode"]
+	if m.cfg.IgnoreExitZero && exitCode == "0" {
+		return
+	}
 
+	// Stop any pending recovery timer (it didn't survive the stability period)
+	if s.StabilityTimer != nil {
+		s.StabilityTimer.Stop()
+	}
+
+	s.IsDown = true
+	s.LastCrashTime = time.Unix(event.Time, 0)
+	s.CrashCount++
+
+	// LOGIC:
+	// If this is the FIRST crash in a while: Send Alert immediately + Start Debounce Timer.
+	// If we are already in a debounce window: Just increment count (suppress alert).
+	
+	if s.CrashCount == 1 {
+		// First crash: Send Notification
+		go m.sendAlert(ctx, s.Name, exitCode, "🔴 Down", fmt.Sprintf("Process exited with code %s", exitCode))
+
+		// Start Debounce/Accumulation Window
+		s.DebounceTimer = time.AfterFunc(m.cfg.DebounceWindow, func() {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			
+			// Window finished. If we had multiple crashes, send summary.
+			if s.CrashCount > 1 {
+				msg := fmt.Sprintf("Crash Loop Detected! Died %d times in last %s", s.CrashCount, m.cfg.DebounceWindow)
+				go m.sendAlert(context.Background(), s.Name, "VAR", "⚠️ Unstable", msg)
+			}
+			
+			// Reset count so next crash triggers immediate alert again? 
+			// Or keep counting? Let's reset to allow new "First" alerts later.
+			// But keep IsDown=true.
+			s.CrashCount = 0 
+		})
+	}
+}
+
+// handleStart processes a potential recovery
+func (m *Monitor) handleStart(ctx context.Context, s *ContainerState) {
+	// If it wasn't marked as down, we don't care about starts (maybe manual restart)
+	if !s.IsDown {
+		return
+	}
+
+	// Stop any existing stability timer (e.g. rapid restart)
+	if s.StabilityTimer != nil {
+		s.StabilityTimer.Stop()
+	}
+
+	// Start a Stability Timer.
+	// Only send "Recovered" if it stays alive for StabilityPeriod.
+	s.StabilityTimer = time.AfterFunc(m.cfg.StabilityPeriod, func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+
+		// If we are here, no 'die' event happened for X seconds.
+		s.IsDown = false
+		s.CrashCount = 0 // Reset crash stats
+		
+		// Cancel Debounce timer if exists (we are healthy now)
+		if s.DebounceTimer != nil {
+			s.DebounceTimer.Stop()
+		}
+
+		go m.sendAlert(context.Background(), s.Name, "0", "✅ Recovered", "Container is running and stable")
+	})
+}
+
+// Helper to check filters
+func (m *Monitor) isContainerAllowed(name string) bool {
+	// Check Include list
+	if len(m.cfg.IncludeContainers) > 0 {
+		found := false
+		for _, allowed := range m.cfg.IncludeContainers {
+			if allowed == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	// Check Exclude list
+	for _, excluded := range m.cfg.ExcludeContainers {
+		if excluded == name {
+			return false
+		}
+	}
+	return true
+}
+
+// Sending Logic
+func (m *Monitor) sendAlert(ctx context.Context, name, exitCode, statusEmoji, details string) {
+	msg := fmt.Sprintf(
+		"<b>%s | %s</b>\n\n"+
+			"📦 <b>Container:</b> <code>%s</code>\n"+
+			"🖥 <b>Server:</b> %s\n"+
+			"📝 <b>Status:</b> %s\n"+
+			"ℹ️ <b>Details:</b> %s",
+		statusEmoji, m.cfg.ServerName,
+		name,
+		m.cfg.ServerName,
+		statusEmoji, // e.g. "🔴 Down" or "✅ Recovered"
+		details,
+	)
+
+	m.postTelegram(ctx, msg)
+}
+
+func (m *Monitor) postTelegram(ctx context.Context, text string) {
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", m.cfg.TelegramToken)
 	payload := map[string]interface{}{
-		"chat_id":    n.cfg.TelegramChatID,
+		"chat_id":    m.cfg.TelegramChatID,
 		"text":       text,
 		"parse_mode": "HTML",
 	}
-
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(body))
-	if err != nil {
-		return err
-	}
+	
+	body, _ := json.Marshal(payload)
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := n.httpClient.Do(req)
+	
+	resp, err := m.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("http request: %w", err)
+		log.Printf("Failed to send TG: %v", err)
+		return
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("telegram api error: status %s", resp.Status)
-	}
-
-	return nil
 }
