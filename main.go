@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -19,7 +20,7 @@ import (
 	"github.com/docker/docker/client"
 )
 
-// Config holds all settings
+// Config holds all application settings
 type Config struct {
 	TelegramToken     string        `env:"TG_TOKEN" required:"true"`
 	TelegramChatID    int64         `env:"TG_CHAT_ID" required:"true"`
@@ -27,27 +28,31 @@ type Config struct {
 	IncludeContainers []string      `env:"INCLUDE_CONTAINERS"`
 	ExcludeContainers []string      `env:"EXCLUDE_CONTAINERS"`
 	IgnoreExitZero    bool          `env:"IGNORE_EXIT_ZERO" default:"true"`
-	DebounceWindow    time.Duration `env:"DEBOUNCE_WINDOW" default:"5m"`  // Time to accumulate errors
-	StabilityPeriod   time.Duration `env:"STABILITY_PERIOD" default:"30s"` // Time to wait before marking "Recovered"
+	DebounceWindow    time.Duration `env:"DEBOUNCE_WINDOW" default:"5m"`
+	StabilityPeriod   time.Duration `env:"STABILITY_PERIOD" default:"30s"`
+	RequestTimeout    time.Duration `env:"REQUEST_TIMEOUT" default:"10s"`
 }
 
-// ContainerState tracks the health of a single container
+// ContainerState tracks the health and timers for a single container
 type ContainerState struct {
 	Name           string
 	CrashCount     int
-	LastCrashTime  time.Time
 	IsDown         bool
-	DebounceTimer  *time.Timer // Timer for sending "Crash Loop" summary
-	StabilityTimer *time.Timer // Timer for sending "Recovered" message
+	LastCrashTime  time.Time
+	DebounceTimer  *time.Timer // Timer to send "Crash Loop" summary
+	StabilityTimer *time.Timer // Timer to confirm "Recovery"
 }
 
-// Monitor holds the global state
+// Monitor is the main application struct
 type Monitor struct {
 	cfg        Config
 	httpClient *http.Client
 	
 	mu     sync.Mutex
 	states map[string]*ContainerState
+
+	// Queue for Telegram messages to prevent 429 Rate Limits
+	msgQueue chan string
 }
 
 func main() {
@@ -58,28 +63,38 @@ func main() {
 		EnvPrefix: "",
 	})
 	if err := loader.Load(); err != nil {
-		log.Fatalf("config error: %v", err)
+		log.Fatalf("config load error: %v", err)
 	}
 
+	// Graceful shutdown context
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	monitor := &Monitor{
 		cfg:        cfg,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		httpClient: &http.Client{Timeout: cfg.RequestTimeout},
 		states:     make(map[string]*ContainerState),
+		msgQueue:   make(chan string, 100), // Buffer up to 100 alerts
 	}
 
 	log.Printf("🔥 Monitor started on %s", cfg.ServerName)
 	log.Printf("⏱  Debounce: %s | Stability: %s", cfg.DebounceWindow, cfg.StabilityPeriod)
 
-	// Retry loop for Docker connection
+	// Start the Telegram Worker (Rate Limiter)
+	go monitor.telegramWorker(ctx)
+
+	// Send startup notification
+	monitor.queueAlert("👻 <b>Monitor Online</b>", "Monitoring service has started/restarted.")
+
+	// Main Retry Loop
 	for {
 		if err := run(ctx, monitor); err != nil {
-			log.Printf("❌ Error: %v. Retrying in 5s...", err)
+			log.Printf("❌ Docker stream error: %v. Retrying in 5s...", err)
 		}
+
 		select {
 		case <-ctx.Done():
+			log.Println("Shutting down...")
 			return
 		case <-time.After(5 * time.Second):
 			continue
@@ -98,11 +113,12 @@ func run(ctx context.Context, m *Monitor) error {
 		return err
 	}
 
-	// Filter: We need both 'die' (crash) and 'start' (recovery)
+	// Subscribe to: Die (Crash), Start (Recovery), Health Status (Unhealthy)
 	args := filters.NewArgs()
 	args.Add("type", "container")
 	args.Add("event", "die")
 	args.Add("event", "start")
+	args.Add("event", "health_status")
 
 	msgs, errs := cli.Events(ctx, events.ListOptions{Filters: args})
 
@@ -123,7 +139,6 @@ func run(ctx context.Context, m *Monitor) error {
 func (m *Monitor) processEvent(ctx context.Context, event events.Message) {
 	containerName := event.Actor.Attributes["name"]
 
-	// 1. Filter Logic
 	if !m.isContainerAllowed(containerName) {
 		return
 	}
@@ -131,29 +146,38 @@ func (m *Monitor) processEvent(ctx context.Context, event events.Message) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Initialize state if not exists
+	// Get or Create State
 	state, exists := m.states[containerName]
 	if !exists {
 		state = &ContainerState{Name: containerName}
 		m.states[containerName] = state
 	}
 
-	switch event.Action {
-	case "die":
-		m.handleDie(ctx, state, event)
-	case "start":
-		m.handleStart(ctx, state)
+	// Convert Action to string for easier comparison
+	action := string(event.Action)
+
+	if action == "die" {
+		m.handleDie(state, event)
+	} else if action == "start" {
+		m.handleStart(state)
+	} else if strings.Contains(action, "health_status: unhealthy") {
+		// Catch specific unhealthy event
+		m.handleUnhealthy(state)
 	}
 }
 
-// handleDie processes a crash
-func (m *Monitor) handleDie(ctx context.Context, s *ContainerState, event events.Message) {
+// --- Event Handlers ---
+
+func (m *Monitor) handleDie(s *ContainerState, event events.Message) {
 	exitCode := event.Actor.Attributes["exitCode"]
-	if m.cfg.IgnoreExitZero && exitCode == "0" {
+	isOOM := event.Actor.Attributes["oomKilled"] == "true"
+
+	// Ignore clean exit if configured
+	if !isOOM && m.cfg.IgnoreExitZero && exitCode == "0" {
 		return
 	}
 
-	// Stop any pending recovery timer (it didn't survive the stability period)
+	// Cancel any pending recovery since it died again
 	if s.StabilityTimer != nil {
 		s.StabilityTimer.Stop()
 	}
@@ -162,80 +186,80 @@ func (m *Monitor) handleDie(ctx context.Context, s *ContainerState, event events
 	s.LastCrashTime = time.Unix(event.Time, 0)
 	s.CrashCount++
 
-	// LOGIC:
-	// If this is the FIRST crash in a while: Send Alert immediately + Start Debounce Timer.
-	// If we are already in a debounce window: Just increment count (suppress alert).
-	
-	if s.CrashCount == 1 {
-		// First crash: Send Notification
-		go m.sendAlert(ctx, s.Name, exitCode, "🔴 Down", fmt.Sprintf("Process exited with code %s", exitCode))
+	// 1. Critical Alert: OOM Killed (Always send)
+	if isOOM {
+		m.sendFormattedAlert(s.Name, "💀 OOM Killed", "Container ran out of memory (RAM limit exceeded)")
+		return
+	}
 
-		// Start Debounce/Accumulation Window
+	// 2. Debounce Logic for normal crashes
+	if s.CrashCount == 1 {
+		// First crash: Alert immediately
+		details := fmt.Sprintf("Process exited with code %s", exitCode)
+		m.sendFormattedAlert(s.Name, "🔴 Down", details)
+
+		// Start Window
 		s.DebounceTimer = time.AfterFunc(m.cfg.DebounceWindow, func() {
 			m.mu.Lock()
 			defer m.mu.Unlock()
-			
-			// Window finished. If we had multiple crashes, send summary.
+
 			if s.CrashCount > 1 {
-				msg := fmt.Sprintf("Crash Loop Detected! Died %d times in last %s", s.CrashCount, m.cfg.DebounceWindow)
-				go m.sendAlert(context.Background(), s.Name, "VAR", "⚠️ Unstable", msg)
+				// Send Summary
+				msg := fmt.Sprintf("Crash Loop: Died %d times in last %s", s.CrashCount, m.cfg.DebounceWindow)
+				m.sendFormattedAlert(s.Name, "⚠️ Unstable", msg)
 			}
-			
-			// Reset count so next crash triggers immediate alert again? 
-			// Or keep counting? Let's reset to allow new "First" alerts later.
-			// But keep IsDown=true.
-			s.CrashCount = 0 
+			// Reset count but keep IsDown true until recovery
+			s.CrashCount = 0
 		})
 	}
+	// If CrashCount > 1, we are silent (debouncing) until timer fires
 }
 
-// handleStart processes a potential recovery
-func (m *Monitor) handleStart(ctx context.Context, s *ContainerState) {
-	// If it wasn't marked as down, we don't care about starts (maybe manual restart)
+func (m *Monitor) handleStart(s *ContainerState) {
+	// Only care if we thought it was down
 	if !s.IsDown {
 		return
 	}
 
-	// Stop any existing stability timer (e.g. rapid restart)
 	if s.StabilityTimer != nil {
 		s.StabilityTimer.Stop()
 	}
 
-	// Start a Stability Timer.
-	// Only send "Recovered" if it stays alive for StabilityPeriod.
+	// Wait for stability period before declaring recovery
 	s.StabilityTimer = time.AfterFunc(m.cfg.StabilityPeriod, func() {
 		m.mu.Lock()
 		defer m.mu.Unlock()
 
-		// If we are here, no 'die' event happened for X seconds.
 		s.IsDown = false
-		s.CrashCount = 0 // Reset crash stats
-		
-		// Cancel Debounce timer if exists (we are healthy now)
+		s.CrashCount = 0
 		if s.DebounceTimer != nil {
 			s.DebounceTimer.Stop()
 		}
 
-		go m.sendAlert(context.Background(), s.Name, "0", "✅ Recovered", "Container is running and stable")
+		m.sendFormattedAlert(s.Name, "✅ Recovered", "Container is running and stable")
 	})
 }
 
-// Helper to check filters
+func (m *Monitor) handleUnhealthy(s *ContainerState) {
+	// Treat unhealthy as a warning, no complex debouncing needed usually
+	// But we can limit it to avoid spam if it stays unhealthy
+	// For simplicity: just fire alert.
+	m.sendFormattedAlert(s.Name, "💊 Unhealthy", "Healthcheck failed")
+}
+
+// --- Helper Functions ---
+
 func (m *Monitor) isContainerAllowed(name string) bool {
-	// Check Include list
+	// 1. Include List (Allowlist)
 	if len(m.cfg.IncludeContainers) > 0 {
-		found := false
-		for _, allowed := range m.cfg.IncludeContainers {
-			if allowed == name {
-				found = true
-				break
+		for _, included := range m.cfg.IncludeContainers {
+			if included == name {
+				return true
 			}
 		}
-		if !found {
-			return false
-		}
+		return false
 	}
-	// Check Exclude list
+	// 2. Exclude List (Blocklist)
 	for _, excluded := range m.cfg.ExcludeContainers {
 		if excluded == name {
 			return false
@@ -244,8 +268,9 @@ func (m *Monitor) isContainerAllowed(name string) bool {
 	return true
 }
 
-// Sending Logic
-func (m *Monitor) sendAlert(ctx context.Context, name, exitCode, statusEmoji, details string) {
+// --- Alerting System ---
+
+func (m *Monitor) sendFormattedAlert(name, statusEmoji, details string) {
 	msg := fmt.Sprintf(
 		"<b>%s | %s</b>\n\n"+
 			"📦 <b>Container:</b> <code>%s</code>\n"+
@@ -255,29 +280,68 @@ func (m *Monitor) sendAlert(ctx context.Context, name, exitCode, statusEmoji, de
 		statusEmoji, m.cfg.ServerName,
 		name,
 		m.cfg.ServerName,
-		statusEmoji, // e.g. "🔴 Down" or "✅ Recovered"
+		statusEmoji,
 		details,
 	)
-
-	m.postTelegram(ctx, msg)
+	m.queueAlert(msg, "") // Second arg empty effectively
 }
 
-func (m *Monitor) postTelegram(ctx context.Context, text string) {
+// queueAlert puts message into channel
+func (m *Monitor) queueAlert(header, body string) {
+	// If body is empty, header is the full message
+	msg := header
+	if body != "" {
+		msg = fmt.Sprintf("<b>%s</b>\n%s", header, body)
+	}
+	
+	select {
+	case m.msgQueue <- msg:
+	default:
+		log.Println("⚠️ Alert queue full, dropping message")
+	}
+}
+
+// telegramWorker processes the queue with rate limiting
+func (m *Monitor) telegramWorker(ctx context.Context) {
+	// Ticker limits us to ~1 message per second (Telegram limit is strict)
+	ticker := time.NewTicker(time.Second) 
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-m.msgQueue:
+			<-ticker.C // Wait for tick
+			m.postTelegram(msg)
+		}
+	}
+}
+
+func (m *Monitor) postTelegram(text string) {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", m.cfg.TelegramToken)
 	payload := map[string]interface{}{
 		"chat_id":    m.cfg.TelegramChatID,
 		"text":       text,
 		"parse_mode": "HTML",
 	}
-	
+
 	body, _ := json.Marshal(payload)
+	// Create context with timeout for the request
+	ctx, cancel := context.WithTimeout(context.Background(), m.cfg.RequestTimeout)
+	defer cancel()
+
 	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
-	
+
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
 		log.Printf("Failed to send TG: %v", err)
 		return
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Telegram API Error: %s", resp.Status)
+	}
 }
