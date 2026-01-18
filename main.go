@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -35,19 +35,24 @@ type Config struct {
 
 // ContainerState tracks the health and timers for a single container
 type ContainerState struct {
-	Name           string
-	CrashCount     int
-	IsDown         bool
-	LastCrashTime  time.Time
-	DebounceTimer  *time.Timer // Timer to send "Crash Loop" summary
-	StabilityTimer *time.Timer // Timer to confirm "Recovery"
+	Name        string
+	CrashCount  int
+	IsDown      bool
+	IsUnhealthy bool
+
+	DebounceTimer  *time.Timer
+	StabilityTimer *time.Timer
+
+	// Generation counters to detect superseded timers
+	debounceGen  int64
+	stabilityGen int64
 }
 
 // Monitor is the main application struct
 type Monitor struct {
 	cfg        Config
 	httpClient *http.Client
-	
+
 	mu     sync.Mutex
 	states map[string]*ContainerState
 
@@ -72,7 +77,7 @@ func main() {
 
 	monitor := &Monitor{
 		cfg:        cfg,
-		httpClient: &http.Client{Timeout: cfg.RequestTimeout},
+		httpClient: &http.Client{},
 		states:     make(map[string]*ContainerState),
 		msgQueue:   make(chan string, 100), // Buffer up to 100 alerts
 	}
@@ -84,7 +89,10 @@ func main() {
 	go monitor.telegramWorker(ctx)
 
 	// Send startup notification
-	monitor.queueAlert("👻 <b>Monitor Online</b>", "Monitoring service has started/restarted.")
+	monitor.queueAlert(fmt.Sprintf(
+		"<b>👻 Monitor Online | %s</b>\nMonitoring service has started/restarted.",
+		cfg.ServerName,
+	))
 
 	// Main Retry Loop
 	for {
@@ -105,12 +113,12 @@ func main() {
 func run(ctx context.Context, m *Monitor) error {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		return err
+		return fmt.Errorf("create docker client: %w", err)
 	}
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 
 	if _, err := cli.Ping(ctx); err != nil {
-		return err
+		return fmt.Errorf("ping docker daemon: %w", err)
 	}
 
 	// Subscribe to: Die (Crash), Start (Recovery), Health Status (Unhealthy)
@@ -128,15 +136,21 @@ func run(ctx context.Context, m *Monitor) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case err := <-errs:
-			return err
-		case event := <-msgs:
-			m.processEvent(ctx, event)
+		case err, ok := <-errs:
+			if !ok {
+				return fmt.Errorf("docker error channel closed")
+			}
+			return fmt.Errorf("docker event stream: %w", err)
+		case event, ok := <-msgs:
+			if !ok {
+				return fmt.Errorf("docker event channel closed")
+			}
+			m.processEvent(event)
 		}
 	}
 }
 
-func (m *Monitor) processEvent(ctx context.Context, event events.Message) {
+func (m *Monitor) processEvent(event events.Message) {
 	containerName := event.Actor.Attributes["name"]
 
 	if !m.isContainerAllowed(containerName) {
@@ -153,16 +167,18 @@ func (m *Monitor) processEvent(ctx context.Context, event events.Message) {
 		m.states[containerName] = state
 	}
 
-	// Convert Action to string for easier comparison
-	action := string(event.Action)
-
-	if action == "die" {
+	switch event.Action {
+	case events.ActionDie:
 		m.handleDie(state, event)
-	} else if action == "start" {
+	case events.ActionStart:
 		m.handleStart(state)
-	} else if strings.Contains(action, "health_status: unhealthy") {
-		// Catch specific unhealthy event
-		m.handleUnhealthy(state)
+	case events.ActionHealthStatus:
+		switch event.Actor.Attributes["health_status"] {
+		case "unhealthy":
+			m.handleUnhealthy(state)
+		case "healthy":
+			m.handleHealthy(state)
+		}
 	}
 }
 
@@ -183,7 +199,6 @@ func (m *Monitor) handleDie(s *ContainerState, event events.Message) {
 	}
 
 	s.IsDown = true
-	s.LastCrashTime = time.Unix(event.Time, 0)
 	s.CrashCount++
 
 	// 1. Critical Alert: OOM Killed (Always send)
@@ -198,25 +213,28 @@ func (m *Monitor) handleDie(s *ContainerState, event events.Message) {
 		details := fmt.Sprintf("Process exited with code %s", exitCode)
 		m.sendFormattedAlert(s.Name, "🔴 Down", details)
 
-		// Start Window
+		// Start debounce window with generation tracking
+		s.debounceGen++
+		gen := s.debounceGen
 		s.DebounceTimer = time.AfterFunc(m.cfg.DebounceWindow, func() {
 			m.mu.Lock()
 			defer m.mu.Unlock()
 
+			// Check if this timer was superseded
+			if s.debounceGen != gen {
+				return
+			}
+
 			if s.CrashCount > 1 {
-				// Send Summary
 				msg := fmt.Sprintf("Crash Loop: Died %d times in last %s", s.CrashCount, m.cfg.DebounceWindow)
 				m.sendFormattedAlert(s.Name, "⚠️ Unstable", msg)
 			}
-			// Reset count but keep IsDown true until recovery
 			s.CrashCount = 0
 		})
 	}
-	// If CrashCount > 1, we are silent (debouncing) until timer fires
 }
 
 func (m *Monitor) handleStart(s *ContainerState) {
-	// Only care if we thought it was down
 	if !s.IsDown {
 		return
 	}
@@ -225,10 +243,17 @@ func (m *Monitor) handleStart(s *ContainerState) {
 		s.StabilityTimer.Stop()
 	}
 
-	// Wait for stability period before declaring recovery
+	// Wait for stability period with generation tracking
+	s.stabilityGen++
+	gen := s.stabilityGen
 	s.StabilityTimer = time.AfterFunc(m.cfg.StabilityPeriod, func() {
 		m.mu.Lock()
 		defer m.mu.Unlock()
+
+		// Check if this timer was superseded
+		if s.stabilityGen != gen {
+			return
+		}
 
 		s.IsDown = false
 		s.CrashCount = 0
@@ -241,59 +266,50 @@ func (m *Monitor) handleStart(s *ContainerState) {
 }
 
 func (m *Monitor) handleUnhealthy(s *ContainerState) {
-	// Treat unhealthy as a warning, no complex debouncing needed usually
-	// But we can limit it to avoid spam if it stays unhealthy
-	// For simplicity: just fire alert.
+	if s.IsUnhealthy {
+		return // Already unhealthy, avoid spam
+	}
+	s.IsUnhealthy = true
 	m.sendFormattedAlert(s.Name, "💊 Unhealthy", "Healthcheck failed")
+}
+
+func (m *Monitor) handleHealthy(s *ContainerState) {
+	// Only care if we thought it was unhealthy
+	if !s.IsUnhealthy {
+		return
+	}
+
+	s.IsUnhealthy = false
+	m.sendFormattedAlert(s.Name, "✅ Recovered", "Healthcheck passed (Service is healthy)")
 }
 
 // --- Helper Functions ---
 
 func (m *Monitor) isContainerAllowed(name string) bool {
 	// 1. Include List (Allowlist)
-	if len(m.cfg.IncludeContainers) > 0 {
-		for _, included := range m.cfg.IncludeContainers {
-			if included == name {
-				return true
-			}
-		}
+	if len(m.cfg.IncludeContainers) > 0 && !slices.Contains(m.cfg.IncludeContainers, name) {
 		return false
 	}
 	// 2. Exclude List (Blocklist)
-	for _, excluded := range m.cfg.ExcludeContainers {
-		if excluded == name {
-			return false
-		}
+	if len(m.cfg.ExcludeContainers) > 0 && slices.Contains(m.cfg.ExcludeContainers, name) {
+		return false
 	}
 	return true
 }
 
 // --- Alerting System ---
 
-func (m *Monitor) sendFormattedAlert(name, statusEmoji, details string) {
-	msg := fmt.Sprintf(
+func (m *Monitor) sendFormattedAlert(name, status, details string) {
+	m.queueAlert(fmt.Sprintf(
 		"<b>%s | %s</b>\n\n"+
 			"📦 <b>Container:</b> <code>%s</code>\n"+
-			"🖥 <b>Server:</b> %s\n"+
 			"📝 <b>Status:</b> %s\n"+
 			"ℹ️ <b>Details:</b> %s",
-		statusEmoji, m.cfg.ServerName,
-		name,
-		m.cfg.ServerName,
-		statusEmoji,
-		details,
-	)
-	m.queueAlert(msg, "") // Second arg empty effectively
+		status, m.cfg.ServerName, name, status, details,
+	))
 }
 
-// queueAlert puts message into channel
-func (m *Monitor) queueAlert(header, body string) {
-	// If body is empty, header is the full message
-	msg := header
-	if body != "" {
-		msg = fmt.Sprintf("<b>%s</b>\n%s", header, body)
-	}
-	
+func (m *Monitor) queueAlert(msg string) {
 	select {
 	case m.msgQueue <- msg:
 	default:
@@ -304,44 +320,87 @@ func (m *Monitor) queueAlert(header, body string) {
 // telegramWorker processes the queue with rate limiting
 func (m *Monitor) telegramWorker(ctx context.Context) {
 	// Ticker limits us to ~1 message per second (Telegram limit is strict)
-	ticker := time.NewTicker(time.Second) 
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
+			m.drainQueue()
 			return
 		case msg := <-m.msgQueue:
-			<-ticker.C // Wait for tick
 			m.postTelegram(msg)
+			// Wait before processing next message
+			select {
+			case <-ctx.Done():
+				m.drainQueue()
+				return
+			case <-ticker.C:
+			}
 		}
 	}
 }
 
+// drainQueue sends remaining messages on shutdown
+func (m *Monitor) drainQueue() {
+	for {
+		select {
+		case msg := <-m.msgQueue:
+			m.postTelegram(msg)
+		default:
+			return
+		}
+	}
+}
+
+const maxRetries = 3
+
 func (m *Monitor) postTelegram(text string) {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", m.cfg.TelegramToken)
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"chat_id":    m.cfg.TelegramChatID,
 		"text":       text,
 		"parse_mode": "HTML",
 	}
 
-	body, _ := json.Marshal(payload)
-	// Create context with timeout for the request
+	body, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Failed to marshal TG payload: %v", err)
+		return
+	}
+
+	var lastErr error
+	for attempt := range maxRetries {
+		if err := m.doTelegramRequest(url, body); err != nil {
+			lastErr = err
+			backoff := time.Duration(1<<attempt) * time.Second // 1s, 2s, 4s
+			log.Printf("TG request failed (attempt %d/%d): %v, retrying in %s", attempt+1, maxRetries, err, backoff)
+			time.Sleep(backoff)
+			continue
+		}
+		return
+	}
+	log.Printf("TG request failed after %d attempts: %v", maxRetries, lastErr)
+}
+
+func (m *Monitor) doTelegramRequest(url string, body []byte) error {
 	ctx, cancel := context.WithTimeout(context.Background(), m.cfg.RequestTimeout)
 	defer cancel()
 
-	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
-		log.Printf("Failed to send TG: %v", err)
-		return
+		return fmt.Errorf("send request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("Telegram API Error: %s", resp.Status)
+		return fmt.Errorf("telegram API error: %s", resp.Status)
 	}
+	return nil
 }
